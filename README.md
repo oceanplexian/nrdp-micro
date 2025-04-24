@@ -22,7 +22,7 @@ A lightweight Go microservice designed to receive Nagios NRDP (Nagios Remote Dat
     *   Git
 2.  **Clone the repository:**
     ```bash
-    git clone <repository-url> # Replace <repository-url> with the actual URL
+    git clone https://github.com/oceanplexian/nrdp-micro
     cd nrdp_micro
     ```
 3.  **Build the binary:**
