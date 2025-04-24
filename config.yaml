@@ -1,0 +1,16 @@
+server:
+  listen_addr: ":8080"
+
+storage:
+  output_dir: "/var/lib/nagios4/spool/checkresults"
+  group_name: "nagios"
+  max_files: 1000
+  min_disk_space_percent: 5.0
+  pause_duration: "10s"
+
+logging:
+  level: "info"
+  verbose: false
+  show_raw: false
+
+database_path: "./nrdp_checks.db" 
