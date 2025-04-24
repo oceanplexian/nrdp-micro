@@ -1,6 +1,4 @@
-![NRDP Microservice Logo](assets/nrdp_micro.png)
-
-# NRDP Microservice
+<img src="assets/nrdp_micro.png" alt="NRDP Microservice Logo" width="250"/>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
