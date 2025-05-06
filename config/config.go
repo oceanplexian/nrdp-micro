@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -17,6 +18,7 @@ type NagiosConfig struct {
 	ServiceTemplate    string `yaml:"service_template"`
 	GenerationInterval string `yaml:"generation_interval"`
 	StaleThreshold     string `yaml:"stale_threshold"`
+	ReloadCommand      string `yaml:"reload_command,omitempty"` // Command to execute on reload
 }
 
 // Config represents the application configuration
@@ -40,7 +42,7 @@ type Config struct {
 	} `yaml:"logging"`
 
 	DatabasePath string       `yaml:"database_path"`
-	Nagios       NagiosConfig `yaml:"nagios_config"`
+	Nagios       NagiosConfig `yaml:"nagios"`
 }
 
 // DefaultConfig returns the default configuration
@@ -99,6 +101,13 @@ func Load(configPath string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("error parsing config file: %v", err)
 	}
+
+	// --- BEGIN DEBUG LOGGING ---
+	log.Printf("[DEBUG] Config loaded. Nagios OutputDir: '%s'", cfg.Nagios.OutputDir)
+	log.Printf("[DEBUG] Config loaded. Nagios ReloadCommand: '%s'", cfg.Nagios.ReloadCommand)
+	log.Printf("[DEBUG] Config loaded. Nagios GenInterval: '%s'", cfg.Nagios.GenerationInterval)
+	log.Printf("[DEBUG] Config loaded. Nagios StaleThreshold: '%s'", cfg.Nagios.StaleThreshold)
+	// --- END DEBUG LOGGING ---
 
 	return cfg, nil
 }
@@ -183,6 +192,8 @@ func (c *Config) Validate() error {
 	if _, err := time.ParseDuration(c.Nagios.StaleThreshold); err != nil {
 		return fmt.Errorf("invalid nagios_config stale_threshold: %v", err)
 	}
+
+	// Note: No validation needed for ReloadCommand, empty means disabled.
 
 	return nil
 }

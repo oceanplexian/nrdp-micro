@@ -2,15 +2,12 @@ package main
 
 import (
 	"encoding/xml"
-	"errors"
 	"flag"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 
 	"nrdp_micro/check"
@@ -27,13 +24,17 @@ var (
 	cfg        *config.Config
 	dbManager  *db.Manager
 
-	// Define the expected path for the Nagios PID file
-	nagiosPIDFile = "/var/run/nagios.pid"
+	// Flag to enable logging of all incoming requests
+	logAllRequests bool
 )
 
 func init() {
 	flag.StringVar(&configFile, "config", "", "Path to configuration file")
 	flag.Parse()
+
+	// Check DEBUG environment variable
+	debugEnv := strings.ToLower(os.Getenv("DEBUG"))
+	logAllRequests = (debugEnv == "1" || debugEnv == "true")
 
 	// Configure logger first with default settings
 	logger.Configure(logger.LevelInfo, log.New(os.Stdout, "", log.Ldate|log.Ltime))
@@ -69,6 +70,47 @@ func init() {
 		logLevel = logger.LevelTrace
 	}
 	logger.Configure(logLevel, log.New(os.Stdout, "", log.Ldate|log.Ltime))
+
+	// Start system monitoring
+	monitorSystem()
+
+	// Start Nagios config generator
+	nagiosGen, err := nagios_config.NewGenerator(&cfg.Nagios, dbManager)
+	if err != nil {
+		logger.Logf(logger.LevelInfo, "Failed to create Nagios config generator: %v", err)
+		os.Exit(1)
+	}
+	nagiosGen.Start()
+
+	// Start goroutine to listen for Nagios config changes and trigger reload
+	go watchNagiosConfigReload(nagiosGen.ReloadChan, cfg.Nagios.ReloadCommand)
+
+	// Log initial storage stats
+	if stats, err := storage.NewManager(
+		cfg.Storage.OutputDir,
+		cfg.Storage.MaxFiles,
+		cfg.Storage.MinDiskSpace,
+	).GetStats(); err == nil {
+		logger.Logf(logger.LevelInfo, "Storage stats: %v", stats)
+	}
+
+	// Create HTTP handler with storage manager and db manager
+	handler := &Handler{
+		storage: storage.NewManager(
+			cfg.Storage.OutputDir,
+			cfg.Storage.MaxFiles,
+			cfg.Storage.MinDiskSpace,
+		),
+		db: dbManager,
+	}
+
+	// Set up HTTP server
+	http.HandleFunc("/", handler.handleRequest)
+	logger.Logf(logger.LevelInfo, "Starting server on %s...", cfg.Server.ListenAddr)
+	if err := http.ListenAndServe(cfg.Server.ListenAddr, nil); err != nil {
+		logger.Logf(logger.LevelInfo, "Server failed: %v", err)
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -97,7 +139,7 @@ func main() {
 	nagiosGen.Start()
 
 	// Start goroutine to listen for Nagios config changes and trigger reload
-	go watchNagiosConfigReload(nagiosGen.ReloadChan, nagiosPIDFile)
+	go watchNagiosConfigReload(nagiosGen.ReloadChan, cfg.Nagios.ReloadCommand)
 
 	// Log initial storage stats
 	if stats, err := storageManager.GetStats(); err == nil {
@@ -127,6 +169,13 @@ type Handler struct {
 func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	defer logger.Logf(logger.LevelDebug, "Handler finished for %s", r.RemoteAddr)
+
+	// Log request details if debug flag is set
+	if logAllRequests {
+		logger.Logf(logger.LevelInfo, "Received request: Method=%s, URL=%s, RemoteAddr=%s, UserAgent=%s",
+			r.Method, r.URL.String(), r.RemoteAddr, r.UserAgent())
+	}
+
 	if r.Method != http.MethodPost {
 		logger.Logf(logger.LevelDebug, "Invalid request method: %s", r.Method)
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
@@ -205,62 +254,41 @@ func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// watchNagiosConfigReload listens on the reload channel and signals Nagios.
-func watchNagiosConfigReload(reloadChan <-chan struct{}, pidFile string) {
-	logger.Logf(logger.LevelInfo, "Starting Nagios reload watcher (PID file: %s)", pidFile)
+// watchNagiosConfigReload listens on the reload channel and executes the reload command.
+func watchNagiosConfigReload(reloadChan <-chan struct{}, reloadCmd string) {
+	if reloadCmd == "" {
+		logger.Logf(logger.LevelInfo, "Nagios reload command is empty, watcher will not execute commands.")
+		// Keep listening to drain the channel if necessary, but do nothing.
+		for range reloadChan {
+			logger.Logf(logger.LevelDebug, "Received Nagios config update signal, but no reload command configured.")
+		}
+		return
+	}
+
+	logger.Logf(logger.LevelInfo, "Starting Nagios reload watcher (command: '%s')", reloadCmd)
 	for range reloadChan {
-		logger.Logf(logger.LevelInfo, "Received Nagios config update signal. Attempting to send SIGHUP...")
-		signalNagiosReload(pidFile)
+		logger.Logf(logger.LevelInfo, "Received Nagios config update signal. Attempting to execute reload command...")
+		executeReloadCommand(reloadCmd)
 	}
 	logger.Logf(logger.LevelInfo, "Nagios reload watcher stopped.") // Should ideally not happen
 }
 
-// signalNagiosReload reads the PID from the specified file and sends SIGHUP.
-func signalNagiosReload(pidFile string) {
-	// Read the PID file content
-	content, err := ioutil.ReadFile(pidFile)
+// executeReloadCommand runs the configured command to reload Nagios.
+func executeReloadCommand(command string) {
+	logger.Logf(logger.LevelDebug, "Executing reload command: %s", command)
+
+	// Use sh -c to handle potential pipelines or complex commands in the string
+	cmd := exec.Command("sh", "-c", command)
+
+	// Capture combined output (stdout and stderr)
+	output, err := cmd.CombinedOutput()
+
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			logger.Logf(logger.LevelInfo, "Warning: Nagios PID file '%s' not found. Cannot send reload signal.", pidFile)
-		} else {
-			logger.Logf(logger.LevelInfo, "Warning: Failed to read Nagios PID file '%s': %v. Cannot send reload signal.", pidFile, err)
-		}
+		logger.Logf(logger.LevelInfo, "Warning: Failed to execute Nagios reload command '%s': %v. Output: %s", command, err, string(output))
 		return
 	}
 
-	// Convert content to PID
-	pidStr := strings.TrimSpace(string(content))
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		logger.Logf(logger.LevelInfo, "Warning: Failed to parse PID from file '%s' (content: '%s'): %v. Cannot send reload signal.", pidFile, pidStr, err)
-		return
-	}
-
-	if pid <= 0 {
-		logger.Logf(logger.LevelInfo, "Warning: Invalid PID %d found in file '%s'. Cannot send reload signal.", pid, pidFile)
-		return
-	}
-
-	// Find the process
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		// This error is less likely with just a PID, but handle it.
-		logger.Logf(logger.LevelInfo, "Warning: Failed to find process with PID %d (from '%s'): %v. Cannot send reload signal.", pid, pidFile, err)
-		return
-	}
-
-	// Send SIGHUP signal
-	if err := process.Signal(syscall.SIGHUP); err != nil {
-		// Check if the error is ESRCH (No such process)
-		if errors.Is(err, syscall.ESRCH) {
-			logger.Logf(logger.LevelInfo, "Warning: Process with PID %d (from '%s') not found. Maybe it terminated? Cannot send reload signal.", pid, pidFile)
-		} else {
-			logger.Logf(logger.LevelInfo, "Warning: Failed to send SIGHUP to Nagios process (PID %d from '%s'): %v", pid, pidFile, err)
-		}
-		return
-	}
-
-	logger.Logf(logger.LevelInfo, "Successfully sent SIGHUP to Nagios process (PID %d) for configuration reload.", pid)
+	logger.Logf(logger.LevelInfo, "Successfully executed Nagios reload command '%s'. Output: %s", command, string(output))
 }
 
 func monitorSystem() {
