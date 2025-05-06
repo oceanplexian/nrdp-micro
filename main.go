@@ -2,10 +2,15 @@ package main
 
 import (
 	"encoding/xml"
+	"errors"
 	"flag"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"nrdp_micro/check"
@@ -21,6 +26,9 @@ var (
 	configFile string
 	cfg        *config.Config
 	dbManager  *db.Manager
+
+	// Define the expected path for the Nagios PID file
+	nagiosPIDFile = "/var/run/nagios.pid"
 )
 
 func init() {
@@ -87,6 +95,9 @@ func main() {
 		os.Exit(1)
 	}
 	nagiosGen.Start()
+
+	// Start goroutine to listen for Nagios config changes and trigger reload
+	go watchNagiosConfigReload(nagiosGen.ReloadChan, nagiosPIDFile)
 
 	// Log initial storage stats
 	if stats, err := storageManager.GetStats(); err == nil {
@@ -194,6 +205,64 @@ func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// watchNagiosConfigReload listens on the reload channel and signals Nagios.
+func watchNagiosConfigReload(reloadChan <-chan struct{}, pidFile string) {
+	logger.Logf(logger.LevelInfo, "Starting Nagios reload watcher (PID file: %s)", pidFile)
+	for range reloadChan {
+		logger.Logf(logger.LevelInfo, "Received Nagios config update signal. Attempting to send SIGHUP...")
+		signalNagiosReload(pidFile)
+	}
+	logger.Logf(logger.LevelInfo, "Nagios reload watcher stopped.") // Should ideally not happen
+}
+
+// signalNagiosReload reads the PID from the specified file and sends SIGHUP.
+func signalNagiosReload(pidFile string) {
+	// Read the PID file content
+	content, err := ioutil.ReadFile(pidFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Logf(logger.LevelInfo, "Warning: Nagios PID file '%s' not found. Cannot send reload signal.", pidFile)
+		} else {
+			logger.Logf(logger.LevelInfo, "Warning: Failed to read Nagios PID file '%s': %v. Cannot send reload signal.", pidFile, err)
+		}
+		return
+	}
+
+	// Convert content to PID
+	pidStr := strings.TrimSpace(string(content))
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		logger.Logf(logger.LevelInfo, "Warning: Failed to parse PID from file '%s' (content: '%s'): %v. Cannot send reload signal.", pidFile, pidStr, err)
+		return
+	}
+
+	if pid <= 0 {
+		logger.Logf(logger.LevelInfo, "Warning: Invalid PID %d found in file '%s'. Cannot send reload signal.", pid, pidFile)
+		return
+	}
+
+	// Find the process
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		// This error is less likely with just a PID, but handle it.
+		logger.Logf(logger.LevelInfo, "Warning: Failed to find process with PID %d (from '%s'): %v. Cannot send reload signal.", pid, pidFile, err)
+		return
+	}
+
+	// Send SIGHUP signal
+	if err := process.Signal(syscall.SIGHUP); err != nil {
+		// Check if the error is ESRCH (No such process)
+		if errors.Is(err, syscall.ESRCH) {
+			logger.Logf(logger.LevelInfo, "Warning: Process with PID %d (from '%s') not found. Maybe it terminated? Cannot send reload signal.", pid, pidFile)
+		} else {
+			logger.Logf(logger.LevelInfo, "Warning: Failed to send SIGHUP to Nagios process (PID %d from '%s'): %v", pid, pidFile, err)
+		}
+		return
+	}
+
+	logger.Logf(logger.LevelInfo, "Successfully sent SIGHUP to Nagios process (PID %d) for configuration reload.", pid)
+}
+
 func monitorSystem() {
 	ticker := time.NewTicker(time.Second)
 	go func() {
@@ -208,14 +277,14 @@ func monitorSystem() {
 		lastMetrics := currentMetrics
 		for range ticker.C {
 			currentMetrics = metrics.GetMetrics()
-			
+
 			// Log metrics based on verbosity and changes
 			if cfg.Logging.Verbose || currentMetrics.HasSignificantChanges(lastMetrics) {
 				logger.Logf(logger.LevelDebug, "%s", currentMetrics.DetailString())
 			} else {
 				logger.Logf(logger.LevelDebug, "%s", currentMetrics.String())
 			}
-			
+
 			lastMetrics = currentMetrics
 		}
 	}()

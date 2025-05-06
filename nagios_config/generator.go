@@ -2,6 +2,7 @@ package nagios_config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -21,6 +22,7 @@ type Generator struct {
 	db             *db.Manager
 	interval       time.Duration
 	staleThreshold time.Duration
+	ReloadChan     chan struct{} // Channel to signal config reload
 }
 
 // NewGenerator creates a new Nagios config generator.
@@ -39,6 +41,7 @@ func NewGenerator(cfg *config.NagiosConfig, dbManager *db.Manager) (*Generator, 
 		db:             dbManager,
 		interval:       interval,
 		staleThreshold: staleThreshold,
+		ReloadChan:     make(chan struct{}), // Initialize the channel
 	}, nil
 }
 
@@ -140,11 +143,31 @@ func (g *Generator) generateConfigs() {
 		}
 	}
 
-	// Write the combined config to a temporary file
+	// Get the new config content
+	newConfigContent := buffer.Bytes()
+
+	// Paths
 	tempFileName := filepath.Join(g.config.OutputDir, "nrdp_generated.cfg.tmp")
 	finalFileName := filepath.Join(g.config.OutputDir, "nrdp_generated.cfg")
 
-	if err := ioutil.WriteFile(tempFileName, buffer.Bytes(), 0644); err != nil {
+	// Read current config content for comparison
+	existingConfigContent, err := ioutil.ReadFile(finalFileName)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Log error if it's not just "file does not exist"
+		logger.Logf(logger.LevelInfo, "Error reading existing Nagios config file %s for comparison: %v", finalFileName, err)
+		// Continue, maybe the file is just missing or permissions issue.
+	}
+
+	// Compare new content with existing content
+	if bytes.Equal(newConfigContent, existingConfigContent) {
+		logger.Logf(logger.LevelDebug, "Generated Nagios config is identical to the existing one (%s). Skipping write and reload signal.", finalFileName)
+		return // No change, do nothing further
+	}
+
+	// Content has changed, proceed with writing and signaling
+
+	// Write the new config to a temporary file
+	if err := ioutil.WriteFile(tempFileName, newConfigContent, 0644); err != nil {
 		logger.Logf(logger.LevelInfo, "Error writing temporary Nagios config file %s: %v", tempFileName, err)
 		return
 	}
@@ -152,11 +175,25 @@ func (g *Generator) generateConfigs() {
 	// Atomically replace the old config file with the new one
 	if err := os.Rename(tempFileName, finalFileName); err != nil {
 		logger.Logf(logger.LevelInfo, "Error renaming temporary Nagios config file to %s: %v", finalFileName, err)
-		os.Remove(tempFileName) // Clean up temp file if rename fails
+		// Attempt to clean up temp file if rename fails
+		if removeErr := os.Remove(tempFileName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			logger.Logf(logger.LevelInfo, "Error removing temporary file %s after rename failure: %v", tempFileName, removeErr)
+		}
 		return
 	}
 
-	logger.Logf(logger.LevelInfo, "Successfully generated Nagios config: %s (%d hosts, %d services)", finalFileName, len(hosts), len(services))
+	logger.Logf(logger.LevelInfo, "Successfully generated and updated Nagios config: %s (%d hosts, %d services)", finalFileName, len(hosts), len(services))
+
+	// Signal that the config has been updated
+	// Use non-blocking send in case no one is listening (though main should be)
+	select {
+	case g.ReloadChan <- struct{}{}:
+		logger.Logf(logger.LevelDebug, "Sent reload signal on ReloadChan")
+	default:
+		// This case should ideally not be hit if main's goroutine is always listening.
+		// It prevents blocking if the channel buffer is full (which it isn't here) or if the receiver isn't ready.
+		logger.Logf(logger.LevelInfo, "ReloadChan is blocked or has no listener, unable to send reload signal immediately.")
+	}
 
 	// Clean up old .cfg files (optional, be careful)
 	/*
